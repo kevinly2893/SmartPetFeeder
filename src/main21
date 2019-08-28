@@ -1,0 +1,1353 @@
+
+
+/** \mainpage
+ * \section intro Introduction
+ * This example demonstrates the use of the WINC1500 with the SAMD21 Xplained Pro
+ * board to implement an MQTT based chat.
+ * It uses the following hardware:
+ * - the SAMD21 Xplained Pro.
+ * - the WINC1500 on EXT1.
+ *
+ * \section files Main Files
+ * - main.c : Initialize the WINC1500, connect to MQTT broker and chat with the other devices.
+ * - mqtt.h : Implementation of MQTT 3.1
+ *
+ * \section usage Usage
+ * -# Configure below code in the main.h for AP information to be connected.
+ * \code
+ *    #define MAIN_WLAN_SSID         "DEMO_AP"
+ *    #define MAIN_WLAN_AUTH         M2M_WIFI_SEC_WPA_PSK
+ *    #define MAIN_WLAN_PSK          "12345678"
+ * \endcode
+ * -# Build the program and download it into the board.
+ * -# On the computer, open and configure a terminal application as the follows.
+ * \code
+ *    Baud Rate : 115200
+ *    Data : 8bit
+ *    Parity bit : none
+ *    Stop bit : 1bit
+ *    Flow control : none
+ *    Line-Ending style : LF or CR+LF
+ * \endcode
+ * -# Start the application.
+ * -# In the terminal window, First of all enter the user name through the terminal window.
+ * -# And after the text of the following is displayed, please enjoy the chat.
+ * -# Initialization operations takes a few minutes according to the network environment.
+ * \code
+ *    Preparation of the chat has been completed.
+ * \endcode
+ *
+ * \section known_issue Known Issue
+ * -# The user name cannot contain space (' ').
+ * -# Cannot send more than 128 bytes.
+ * -# User name must be unique. If someone uses the same user name, Which one will be disconnected.
+ * -# USART interface has not error detection procedure. So sometimes serial input is broken.
+ *
+ * \section compinfo Compilation Information
+ * This software was written for the GNU GCC compiler using Atmel Studio 6.2
+ * Other compilers may or may not work.
+ */
+
+#include "asf.h"
+#include "main.h"
+#include "driver/include/m2m_wifi.h"
+#include "MQTTClient/Wrapper/mqtt.h"
+#include "socket/include/socket.h"
+#include "stdio.h"
+#include "stdlib.h"
+#include "string.h"
+
+/* Application instruction phrase. */
+#define STRING_EOL    "\r\n"
+#define STRING_HEADER "-- WINC1500 Wi-Fi MQTT chat example --"STRING_EOL \
+	"-- "BOARD_NAME " --"STRING_EOL	\
+	"-- Compiled: "__DATE__ " "__TIME__ " --"STRING_EOL
+
+/** UART module for debug. */
+static struct usart_module cdc_uart_module;
+
+/** User name of chat. */
+char *mqtt_user = "Smart Pet Feeder";
+const char* transmit;
+const char* Sub_Topic;
+char *TopicFoodBowl = "SJSU23/BowlFoood";
+char *TopicFoodLevel = "SJSU23/FoodLevel";
+
+
+/* Instance of MQTT service. */
+static struct mqtt_module mqtt_inst;
+
+/* Receive buffer of the MQTT service. */
+static unsigned char mqtt_read_buffer[MAIN_MQTT_BUFFER_SIZE];
+static unsigned char mqtt_send_buffer[MAIN_MQTT_BUFFER_SIZE];
+
+/** UART buffer. */
+static char uart_buffer[MAIN_CHAT_BUFFER_SIZE];
+
+/** Written size of UART buffer. */
+static int uart_buffer_written = 0;
+
+/** A buffer of character from the serial. */
+static uint16_t uart_ch_buffer;
+
+/** Prototype for MQTT subscribe Callback */
+void SubscribeHandler(MessageData *msgData);
+void Simple_Clk_Init(void);
+void enable_clock(void);
+void enable_tc(void);
+void enable_interrupt(void);
+void init_adc(void);
+void init_adc2(void);
+unsigned int read_adc(void);
+unsigned int read_adc2(void);
+
+#define seconds_per_day    8640000
+#define compareNum    23
+
+#define foodlevel5    0
+#define foodlevel4    1680
+#define foodlevel3    1999
+#define foodlevel2    2210
+#define foodlevel1    2370
+#define foodlevel0    3000
+
+#define weightlevel6    2300
+#define weightlevel5    1765
+#define weightlevel4    1710
+#define weightlevel3    1650
+#define weightlevel2    1586
+#define weightlevel1    1523
+#define weightlevel0    1464
+#define weightlevel     1000
+
+#define False 0
+#define True 1
+
+#define duration 28
+#define duration_time 280
+
+#define wordcount 44
+
+#define empty_schedule -1
+#define matched         0
+//#define NONE 3
+//#define empty 126275111
+
+Port *ports = PORT_INSTS; 
+volatile int count;
+int seconds = 0;
+int minute=0, hour=0, sec=0; 
+volatile int real_time = 0;
+int connection = 0;
+int t=1;             //scale number to calculate the time while the wifi is disconnected
+int schedule_time[] = {-1,-1,-1};   //up to 3 schedule per day
+//int schedule_pending[] = {empty,empty,empty,empty};
+int backup_sche[] = {80000,140000,210000};     //pre-set back up schedules in case the wifi is disconnected
+int food_level = 4; 
+int reply = 0;                      //different cases for reply message 
+TcCount16* tcPtr = &(TC5->COUNT16);  //timer interrupt trigger 60Hz
+Adc* adcPtr = (Adc*) ADC;
+Adc* adcPtr2 = (Adc*) ADC;
+void wait(int tt)
+{
+	count = 0;
+	while (count < tt * 500000)
+	{
+		count++;
+	}
+}
+
+int x;       //x - account for the food level
+int y;       //y - account for the weight sensor
+int weight;  
+int wifi_disconnect = 0;       //
+int wifi_dis_time = 0;       //
+int wifi_dis_timestart = 0; 
+int wifi_dis_timeend = 0; 
+//int weightcheck = 0;
+int half_feed = False;
+int feed_order=0;                   //variable to save the feeding schedule
+int r=0;
+int current_time;
+int portion = 1;                    //feeding portion - default to 1
+int portionSche[] = {1,1,1};  //store schedule 
+int portion_checktime = -1;    // variable to check time
+float PCHECK;
+int portionn[] = {1,1,1};    //store the portion for schedule feature
+uint32_t length; //check the data length
+char *schedule_topic[] = {"Schedule1","Schedule2","Schedule3"};
+char no_schedule[50] = {0};
+int reset=0; 
+int feedstatus_checktime = -1;
+char *bowl_portion;
+int fsct[]={-1,-1,-1};
+int FBhour, FBminute, FBsecond;
+int replySchedule = 0;
+
+// ADC configure for food level
+unsigned int read_adc(void)
+{
+
+	// start the conversion, see 0x0C in the table in Section 29.7
+	adcPtr -> SWTRIG.reg |= (0b1<<1) ;
+	
+	while(!(adcPtr->INTFLAG.bit.RESRDY));			//wait for conversion to be available
+	
+	return(adcPtr->RESULT.reg); 					//insert register where ADC store value
+
+}
+
+//ADC configure for food bowl
+unsigned int read_adc2(void)
+{
+
+	// start the conversion, see 0x0C in the table in Section 29.7
+	adcPtr2 -> SWTRIG.reg |= (0b1<<1) ;
+	
+	while(!(adcPtr2->INTFLAG.bit.RESRDY));			//wait for conversion to be available
+	
+	return(adcPtr2->RESULT.reg); 					//insert register where ADC store value
+
+}
+
+
+/**
+ * \brief Callback of USART input.
+ *
+ * \param[in] module USART module structure.
+ */
+static void uart_callback(const struct usart_module *const module)
+{
+	/* If input string is bigger than buffer size limit, ignore the excess part. */
+	if (uart_buffer_written < MAIN_CHAT_BUFFER_SIZE) {
+		uart_buffer[uart_buffer_written++] = uart_ch_buffer & 0xFF;
+	}
+}
+
+/**
+ * \brief Callback to get the Wi-Fi status update.
+ *
+ * \param[in] msg_type type of Wi-Fi notification. Possible types are:
+ *  - [M2M_WIFI_RESP_CURRENT_RSSI](@ref M2M_WIFI_RESP_CURRENT_RSSI)
+ *  - [M2M_WIFI_RESP_CON_STATE_CHANGED](@ref M2M_WIFI_RESP_CON_STATE_CHANGED)
+ *  - [M2M_WIFI_RESP_CONNTION_STATE](@ref M2M_WIFI_RESP_CONNTION_STATE)
+ *  - [M2M_WIFI_RESP_SCAN_DONE](@ref M2M_WIFI_RESP_SCAN_DONE)
+ *  - [M2M_WIFI_RESP_SCAN_RESULT](@ref M2M_WIFI_RESP_SCAN_RESULT)
+ *  - [M2M_WIFI_REQ_WPS](@ref M2M_WIFI_REQ_WPS)
+ *  - [M2M_WIFI_RESP_IP_CONFIGURED](@ref M2M_WIFI_RESP_IP_CONFIGURED)
+ *  - [M2M_WIFI_RESP_IP_CONFLICT](@ref M2M_WIFI_RESP_IP_CONFLICT)
+ *  - [M2M_WIFI_RESP_P2P](@ref M2M_WIFI_RESP_P2P)
+ *  - [M2M_WIFI_RESP_AP](@ref M2M_WIFI_RESP_AP)
+ *  - [M2M_WIFI_RESP_CLIENT_INFO](@ref M2M_WIFI_RESP_CLIENT_INFO)
+ * \param[in] pvMsg A pointer to a buffer containing the notification parameters
+ * (if any). It should be casted to the correct data type corresponding to the
+ * notification type. Existing types are:
+ *  - tstrM2mWifiStateChanged
+ *  - tstrM2MWPSInfo
+ *  - tstrM2MP2pResp
+ *  - tstrM2MAPResp
+ *  - tstrM2mScanDone
+ *  - tstrM2mWifiscanResult
+ */
+static void wifi_callback(uint8 msg_type, void *msg_data)
+{
+	tstrM2mWifiStateChanged *msg_wifi_state;
+	uint8 *msg_ip_addr;
+
+	switch (msg_type) {
+	case M2M_WIFI_RESP_CON_STATE_CHANGED:
+		msg_wifi_state = (tstrM2mWifiStateChanged *)msg_data;
+		if (msg_wifi_state->u8CurrState == M2M_WIFI_CONNECTED) {
+			/* If Wi-Fi is connected. */
+			printf("Wi-Fi connected\r\n");
+			printf("\nReal time:%i", real_time);
+			m2m_wifi_request_dhcp_client();
+		} else if (msg_wifi_state->u8CurrState == M2M_WIFI_DISCONNECTED) {
+			/* If Wi-Fi is disconnected. */
+			printf("Wi-Fi disconnected\r\n");
+			t=480;
+			printf("\nWFD_Real time:%i", real_time);
+			wifi_disconnect = 1;
+			if (wifi_dis_time == 0) {
+				wifi_dis_timestart = real_time;
+				printf("\nWFD_Start time:%i", wifi_dis_timestart);
+				wifi_dis_time = 1;
+				reply = 1;
+			}
+			m2m_wifi_connect((char *)MAIN_WLAN_SSID, sizeof(MAIN_WLAN_SSID),
+					MAIN_WLAN_AUTH, (char *)MAIN_WLAN_PSK, M2M_WIFI_CH_ALL);
+			/* Disconnect from MQTT broker. */
+			/* Force close the MQTT connection, because cannot send a disconnect message to the broker when network is broken. */
+			mqtt_disconnect(&mqtt_inst, 1);
+		}
+
+		break;
+
+	case M2M_WIFI_REQ_DHCP_CONF:
+		msg_ip_addr = (uint8 *)msg_data;
+		printf("Wi-Fi IP is %u.%u.%u.%u\r\n",
+				msg_ip_addr[0], msg_ip_addr[1], msg_ip_addr[2], msg_ip_addr[3]);
+		/* Try to connect to MQTT broker when Wi-Fi was connected. */
+		mqtt_connect(&mqtt_inst, main_mqtt_broker);
+		break;
+
+	default:
+		break;
+	}
+}
+
+/**
+ * \brief Callback to get the Socket event.
+ *
+ * \param[in] Socket descriptor.
+ * \param[in] msg_type type of Socket notification. Possible types are:
+ *  - [SOCKET_MSG_CONNECT](@ref SOCKET_MSG_CONNECT)
+ *  - [SOCKET_MSG_BIND](@ref SOCKET_MSG_BIND)
+ *  - [SOCKET_MSG_LISTEN](@ref SOCKET_MSG_LISTEN)
+ *  - [SOCKET_MSG_ACCEPT](@ref SOCKET_MSG_ACCEPT)
+ *  - [SOCKET_MSG_RECV](@ref SOCKET_MSG_RECV)
+ *  - [SOCKET_MSG_SEND](@ref SOCKET_MSG_SEND)
+ *  - [SOCKET_MSG_SENDTO](@ref SOCKET_MSG_SENDTO)
+ *  - [SOCKET_MSG_RECVFROM](@ref SOCKET_MSG_RECVFROM)
+ * \param[in] msg_data A structure contains notification informations.
+ */
+static void socket_event_handler(SOCKET sock, uint8_t msg_type, void *msg_data)
+{
+	mqtt_socket_event_handler(sock, msg_type, msg_data);
+}
+
+/**
+ * \brief Callback of gethostbyname function.
+ *
+ * \param[in] doamin_name Domain name.
+ * \param[in] server_ip IP of server.
+ */
+static void socket_resolve_handler(uint8_t *doamin_name, uint32_t server_ip)
+{
+	mqtt_socket_resolve_handler(doamin_name, server_ip);
+}
+
+/**
+ * \brief Callback to receive the subscribed Message.
+ *
+ * \param[in] msgData Data to be received.
+ */
+
+//Message Handler from MQTT topic
+void SubscribeHandler(MessageData *msgData)
+{
+	//read_adc();
+	
+	PortGroup *porB = &(ports->Group[1]);           // pointer to reference portB's adress
+	porB->DIRSET.reg = PORT_PB12;                   //set output on PB12
+	char *messagecheck;                             //store input message
+	char *topiccheck;                               //store topic
+	sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "SmartPetF");   //store topic and 'SPF' to Sub_topic
+	printf("Subtopic: %s", Sub_Topic);
+	
+	
+	//Key word to communicate with the device
+	char *feed = "Feed";                                 //command remotely feed
+	char *cancel[] = {"cancel1","cancel2","cancel3"};    //cancel the feed schedule
+	char *currentTime = "ct";                            //keyword of checking  current time 
+	char *sch = "Schedule ";                             //check retained message for schedule
+	char *feed_sche = "schedule";                        //string to check the feeding schedule message
+	char *level = "level";                               //checking food level
+	char *foodbowl = "foodbowl";                         //checking food left over in bowl message
+	char *clearschedule = "Clear";                       //clear all schedule message
+	char *halfFeed = "half";                             //dispense half portion
+	char *portions[] = {"1","2","3"};                    //up to 3 portion
+	//int food_level = 4; 
+	int percent;                                         //food level percentage
+	
+	//character array to store several reply messages
+	char messagebreak[75] = {0};
+	char str[75] = {0};
+	char str4[75] = {0};
+	char str0[75] = {0};
+	char str00[75] = {0};
+	char schedule[75] = {0};
+	char str1[75] = {0};
+	char str2[200] = {0};
+	char str3[75] = {0};
+	char sche[3][75];
+	char Wstring[75] = {0};
+	char wifistring[75] = {0};
+	char string[75] = {0};
+	char *string0;
+	char *string1;
+
+	/* You received publish message which you had subscribed. */
+	/* Print Topic and message */
+	printf("\r\n %.*s",msgData->topicName->lenstring.len,msgData->topicName->lenstring.data);
+	printf(">>");
+	printf("%.*s",msgData->message->payloadlen,(char *)msgData->message->payload);
+	
+	//store the message and topic
+	messagecheck = msgData->message->payload;             
+	topiccheck = msgData->topicName->lenstring.data;
+	
+	for (int i = 0; i<50;i++){
+		messagebreak[i]=messagecheck[11+i];                    //break and store part of the message
+	}
+	printf("\r\nMessage Check: %s", messagecheck);
+	printf("\r\nTopic Check: %s", topiccheck);
+	
+	int lengthh = strlen(TopicFoodBowl);                       //distinguish the topic that send food in bowl and food level
+	if (strncmp(topiccheck, TopicFoodBowl, lengthh)==0) {
+		printf("\nMatch");
+	}
+	else printf("\nNot Matched");
+	//if the food is dispense base on the schedule, the following message is send
+	if (reply==8){
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "SmartPetF");
+		transmit = "The food was dispense based on your set schedule.";
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );  //send the message to the server using mqtt_publish
+		reply = 0;            //re-set the reply message case
+
+	} 
+	
+	//Send notification if the wifi is disconnected
+	if (reply==1){
+		sprintf(wifistring, "The Internet is lost from %i:%i:%i to %i:%i:%i. The back-up schedules were used", wifi_dis_timestart/10000,wifi_dis_timestart/100-wifi_dis_timestart/10000*100,wifi_dis_timestart-wifi_dis_timestart/100*100,wifi_dis_timeend/10000,wifi_dis_timeend/100-wifi_dis_timeend/10000*100,wifi_dis_timeend-wifi_dis_timeend/100*100);
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "SmartPetF");
+		transmit = wifistring;
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );
+		reply = 0;            //re-set the reply message case
+	}
+	
+	/*if (reply==9) {
+		sprintf(string, "Portion%s", bowl_portion);
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "FoodBowl1");
+		transmit = string;
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );
+		reply = 0;
+	}*/
+	
+	//Check food on bowl after 3ms
+	if (strcmp(messagecheck, foodbowl)==matched){
+		feedstatus_checktime = real_time+3;
+	}
+	
+	//Dispense half of the portion
+	if (strcmp(messagecheck, halfFeed)==matched){
+		porB->OUTSET.reg = PORT_PB12;
+		wait(duration/2);
+		porB->OUTCLR.reg = PORT_PB12;
+	}
+	
+	//Clear all feed schedules
+	if (strcmp(messagecheck, clearschedule)==matched){
+		for (int sc=0; sc<3; sc++){
+			schedule_time[sc] = empty_schedule;
+		}
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "updatesch");
+		transmit = "1. Schedule #1 is empty \n2. Schedule #2 is empty \n3. Schedule #3 is empty";
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message 
+	}
+	
+	//initiate a food level checking
+	if (strcmp(messagecheck, level)==matched){
+	    sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "LevelFood");
+	    transmit = "Checking the food level....";                     //call a retained message to check the level
+	    length = strlen(transmit);
+	    mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish a retained message  
+		NVIC_SystemReset();                                                    //software reset to re-measure the ADC pin
+	}
+	
+	//Check the food level
+	if (strcmp(messagecheck, "Checking the food level....")==matched){               
+		if (food_level<foodlevel4) percent = 100;                                     //based on ADC reading, define the level: 100, 70, 50,30, 10
+		else if ((food_level>=foodlevel4)&&(food_level<foodlevel3)) percent = 70;
+		else if ((food_level>=foodlevel3)&&(food_level<foodlevel2)) percent = 50;
+		else if ((food_level>=foodlevel2)&&(food_level<foodlevel1)) percent = 30;
+		else if ((food_level>=foodlevel1)&&(food_level<foodlevel0)) percent = 10;
+		sprintf(str3, "%i", percent);
+		//reply = 7;
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "FoodLevel");
+		transmit = str3;                                                       //food level message
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message 
+		
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "LevelFood");
+		transmit = "";                                                         //clear the retained message
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message 
+	}
+	
+	//Store the time the check the food left over on bowl - usually 1 hour after the any dispense
+	if (strncmp(messagecheck, "Food-on-bowl status update time: ", compareNum)==matched){
+		feedstatus_checktime = atoi(&messagecheck[33]);   
+	} 
+	
+	//check the food left over in bowl
+	printf("\nfeed status: %i", feedstatus_checktime);
+	printf("\nMess: %s", messagebreak);
+	if (strncmp(messagebreak, "Checking the amount of food on bowl...", compareNum)==matched){
+		//weightcheck = 1;
+		sprintf(string, "%s", bowl_portion);                                   //message of the food in bowl
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "BowlFoood");
+		transmit = string;
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message 
+		
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "Food-Bowl");
+		transmit = "";                                                         //clear the retained message in "Food-Bowl" topic 
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message 
+	}
+	
+	//Check the food leftover on bowl before dispense the food, if portion:2, food left over: 1.5 --> only dispense 0.5 portion
+	if (strcmp(messagecheck, "Check before dispense")==0){          //portion and feeding schedule
+		int portion_order=atoi(&messagebreak[wordcount]);       //get portion
+		int food_bowl_weight = (atoi(bowl_portion))/2;            //get food left over
+		portionn[portion_order] = portionSche[portion_order] - food_bowl_weight;     //minus out to get the dispensing portion
+		if (portionn[portion_order]<=0) portionn[portion_order] = 0;                 //if food left over>portion, dispense 0 portion
+		if ((portionn[portion_order]>0) && ((strcmp(bowl_portion,"1") == matched) || (strcmp(bowl_portion,"3") == matched) || (strcmp(bowl_portion,"5") == matched))) {
+			portionn[portion_order] -= 1;
+			half_feed = True;              //dispense half of portion
+		}
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "Food-Bowl");
+		transmit = "";                                                        //clear retained message
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message 
+		
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "FoodBBowl");
+		char str111[75] = {0};
+		sprintf(str111, "\nfoodbowl: %s", bowl_portion);
+		transmit = str111;                                                         //clear the retained message in "Food-Bowl" topic
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,0 );
+		
+		char str222[75] = {0};
+		if (half_feed == False)
+		sprintf(str222,"\nFeed Portion after FOB check: %i" , portionn[portion_order]);
+		if (half_feed == True) sprintf(str222, "\nFeed Portion after FOB check: %i.5" , portionn[portion_order]);
+		transmit = str222;                                                         //clear the retained message in "Food-Bowl" topic
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,0 );
+		
+	}
+	
+	/*if (((bowl_portion == "0.5") || (bowl_portion == "1.5") || (bowl_portion == "2.5"))) printf("\nbowl portion = half");
+	for (int g =0;g<3;g++){
+		printf("\n\rPortionSche%i : %i", g+1, portionSche[g]);
+	}*/
+	
+	int diff, ctCOUNT=0; 
+	int ct_totalsec, ct_hours , ct_minutes, ct_sec;      //second, minute, hour for current time
+	int schedule_hours, schedule_minutes;          //hour, minute for schedules                           
+	//--- set 11:30am as the current real time
+	//Set up current time, key word in message: ct 1130 for 11:30
+	while (ctCOUNT <2){
+		diff = messagecheck[ctCOUNT]- currentTime[ctCOUNT];                //if not the right key word 'ct', break
+		if (diff!=0) break;
+		ctCOUNT++;
+		if (ctCOUNT==2){  
+			ct_sec = 0;                                          //key word 'ct' is matched
+			current_time = atoi(&messagecheck[2]);            //store the current time into an integer    
+			if (current_time>2359) {                          //second is also set,  075111 - 7:51:11
+				ct_sec = current_time - (current_time/100)*100;
+				current_time = current_time/100;
+			}   
+			else ct_sec = 0;                       
+			int tt = current_time/100;                                 //calculate for the total second    
+			seconds = 100*(tt*3600+(current_time-tt*100)*60+ct_sec);   //keep updating the clock
+			ct_totalsec = seconds/100;                                 //calculate individually the second, minute, hour of the current time
+			ct_hours = ct_totalsec/3600;
+			ct_minutes = (ct_totalsec-ct_hours*3600)/60;
+			sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "Current T");
+			sprintf(str,"Current time is recoded - %i:%i:%i", ct_hours, ct_minutes, ct_sec);     //store current time message
+			transmit = str;
+			length = strlen(transmit);
+			mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,0 );           //publish the message 
+			
+			sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "CTschedul");
+			transmit = "";                                                         //clear retained message
+			length = strlen(transmit);                                             
+			mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message 
+		}
+	}
+	
+	//Set up feeding schedule
+	//convert string to integer - check if a feeding schedule is set
+	for (int sche_count=0;sche_count<3;sche_count++){
+		if (messagecheck[sche_count]< '0' || messagecheck[sche_count]> '9' || (strncmp(topiccheck, TopicFoodLevel, lengthh)==0)) break;    //if the input message is not number, break
+		if (sche_count<2) continue;	                     
+		
+		int int_mess = atoi(messagecheck);           //format 0830 for 8:30am, 20:45 for 8:45 pm
+		if (int_mess>2359) {reply=6;break;}          //if not within 24:00:00, break, send error message
+		if (feed_order==3)   //if 3 schedules are set
+		    feed_order = 0;  //reset back to the first one
+		schedule_time[feed_order] = int_mess*100;    //*100 is for counting the second
+		portionSche[feed_order] = portion;           //store portions for each schedule
+		printf("\n\rCheckPortionSche%i : %i", feed_order+1, portionSche[feed_order]);
+		portionn[feed_order] = portionSche[feed_order];
+		//calculate the feeding schedule time
+		schedule_hours = int_mess/100;              //calculate the hour and minute individually
+		schedule_minutes = (int_mess-schedule_hours*100);
+		if (schedule_minutes<2) fsct[feed_order] = ((schedule_hours-1)*100+ 59)*100;         //set the time for checking the food leftover 2 minutes before the feeding schedule time
+		else if (schedule_minutes>=2) fsct[feed_order] = (schedule_hours*100+ schedule_minutes-2)*100;
+		//printf("\nTime to check for feed based on schedule%i %i", feed_order, fsct[feed_order]);
+		sprintf(str0, "Feeding schedule #%i is set: %i:%i:00.", feed_order+1, schedule_hours, schedule_minutes);     //store a new string to str
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, schedule_topic[feed_order]);
+		sprintf(schedule, "Schedule %i: %s00 - %i portions.  ",feed_order+1, messagecheck, portionSche[feed_order]);
+		transmit = schedule;
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish reatained the message 
+		string0=str0;             //store above string to char * t0
+		reply = 4;           //reply-message case: 4
+		replySchedule = 12;  
+		feed_order++;        //next feed schedule    
+	}
+	
+	for (int i=0;i<3;i++){
+	printf("\r\nSchedule %i: %i",i, schedule_time[i]);
+	printf("\r\nBack up Schedule %i: %i",i, backup_sche[i]);
+	printf("\nTime to check for feed based on schedule%i %i", i, fsct[i]);}
+	
+	//Get the feeding schedule time from retain message -- after the software reset
+	int retained_count = 0;
+	while (retained_count <4){
+		diff = messagecheck[retained_count]- sch[retained_count];                
+		if (diff!=0) break;
+		retained_count++;
+		if (retained_count==4){                                            
+			r = atoi(&messagecheck[9])-1;                                 //get the order of the feeding schedule
+			schedule_time[r] = atoi(&messagecheck[12]);                   //get the feeding schedule
+			if (schedule_time[r] > 0) portionSche[r] = atoi(&messagecheck[20]);
+			//if (schedule_time[r] = -1) feed_order=r;
+			printf("\n\rRetainedortionSche%i : %i", r, portionSche[r+1]);
+		}
+	}
+	
+	//cancel the feeding schedules
+	for (int i=0;i<3;i++){
+		if (strcmp(messagecheck, cancel[i])==matched) {
+			schedule_time[i] = empty_schedule;  //if "cancel" message is sent, cancel that feeding schedule
+			fsct[i] = empty_schedule;           //cancel checking food left over schedule
+			feed_order = i;         //the next feeding schedule will be set into the canceled slot 
+			sprintf(str00, "Feeding schedule #%i is canceled.", i+1);  //store a new string to str
+			string0 = str00;          //store above string to char * t0
+			reply = 4;                //reply-message case: 4
+			replySchedule = 12;
+			sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, schedule_topic[i]);
+			sprintf(no_schedule, "Schedule %i: -1",i+1);    
+			transmit = no_schedule;
+			length = strlen(transmit);
+			mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message 
+		}
+		 
+		//Set feeding portion
+		if ((strcmp(messagecheck, portions[i])==0) && (strncmp(topiccheck, TopicFoodBowl, lengthh)!=0)) {     //if '1' or '2' or '3' is send
+			portion = i+1;                              //store to portion (since i=0 -> i+1)
+			sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "PortionPF");
+			sprintf(str4, "Portion: %i", portion);      // new reply message
+			transmit = str4;
+			length = strlen(transmit);
+			mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message     
+		}
+		if (strncmp(messagecheck, "Portion: ", 9)==0){  //store portion from retained message
+			portion = atoi(&messagecheck[9]);
+			//portionn = portion;
+			
+		}
+		//Store a string containing information about the feeding schedule
+		if (schedule_time[i]>0){ 
+			char *am_pm;
+			if (schedule_time[i]>120000)  {                                //if schedule is set
+			schedule_hours = (schedule_time[i]-120000)/10000;
+			schedule_minutes = (schedule_time[i]-120000-schedule_hours*10000)/100;
+			if (schedule_hours==0) schedule_hours =12;
+			am_pm = "pm";                                                  //set pm
+			}
+			else if (schedule_time[i]<=120000)  {                          //if schedule is set
+				schedule_hours = schedule_time[i]/10000;
+				schedule_minutes = (schedule_time[i]-schedule_hours*10000)/100;
+				am_pm = "am";
+				if (schedule_time[i] == 120000) am_pm = "pm";
+			}
+			sprintf(sche[i], "\n%i. Schedule #%i is set at %i:%i:00%s with %i portion ", i+1, i+1, schedule_hours, schedule_minutes, am_pm, portionSche[i]);      //store it
+		}
+		else if (schedule_time[i]<=0){
+			sprintf(sche[i], "\n%i. Schedule #%i is empty", i+1, i+1);	
+			feed_order=i;
+			}                         
+			//store 'empty' if there is no feeding schedule   
+	}  
+                                                              
+	sprintf(str1, "%s %s %s", sche[0], sche[1], sche[2]);	//completed feeding schedule string
+	printf("%s", str0);  
+	if (strcmp(messagecheck, feed_sche)==0){       //if 'schedule' is sent
+		reply = 5;	                               //reply-message case: 5
+	}
+	
+	char stringSchedule[75] = {0};
+	sprintf(stringSchedule, "%s", string0);
+	string1=str1;
+	if (replySchedule==12)     {              //if reply-message case is call,
+		sprintf(str2, "%s ", string1);        //store a string including t0: just saved schedule or just canceled schedule and
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "updatesch");
+		transmit = str2;
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message 
+		replySchedule = 0;
+	}	                                      
+	printf("\n%i", real_time); 
+	printf("\n%i", seconds);
+    //If "Feed" is sent, rotate the motor
+	if (strcmp(messagecheck, feed)==0) {
+		
+			porB->OUTSET.reg = PORT_PB12;      //set PB12 high (3.3V) so it can supply voltage for the circuit to rotate the motor
+			wait(duration*portion);                          //rotate for 4s
+			porB->OUTCLR.reg = PORT_PB12;
+			//reply = 3;
+			seconds=seconds+duration_time*portion;
+		
+		/*sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "RemoteFeed");
+		sprintf(portionstring, "%i", portion);      // new reply message
+		transmit = portionstring;
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,0 );*/
+		
+		int FBtotsecond = (seconds+360000)/100;         
+		FBhour = FBtotsecond/3600;
+		FBminute = (FBtotsecond-FBhour*3600)/60;
+		FBsecond = (FBtotsecond -(3600*FBhour)-(FBminute*60));
+		feedstatus_checktime = FBhour*10000+FBminute*100+FBsecond;             //calculate for the time to check the food left over, 1 hour after
+		
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "Food-Bowl");
+		sprintf(Wstring, "Food-on-bowl status update time: %i", feedstatus_checktime);       //message for leftover food check time
+		transmit = Wstring;  
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message 
+		
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "LevelFood");             
+		transmit = "Checking the food level....";                              //call for a food level checking
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );           //publish the message 
+		NVIC_SystemReset();
+	}
+	
+	if (strncmp(messagebreak, "Checking before dispensing based on schedule", compareNum)==matched){
+		portion_checktime = ct_hours*10000+ct_minutes*100+ct_sec+10;
+		printf("\nportion_checktime: %i\n", portion_checktime);
+	}
+	//else porB->OUTCLR.reg = PORT_PB12;
+	
+	//x = 1262;			// store variable from ADC into variable "x"
+    
+	//Replied message
+	switch(reply){ 
+		/*case 1  : transmit = wifistring;                      //send # of portion
+		          break;*/
+		case 2  : //transmit = str;                       //send current time
+		          break;
+		case 3  : transmit = "The food is dispensed"; 
+		          break;	
+		case 4  : transmit = stringSchedule;                      //send schedule that is just recorded or canceled
+		          break;
+		case 5  : transmit = str1;                      //send all three schedules
+		          break;
+		case 6  : transmit = "Invalid schedule time inserted.  Insert between 00:00 and 23:59";
+		          break;
+		default : break;
+	}
+	//use the string in transmit from above switch case to publish the message
+	if (reply!=0){     
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "SmartPetF");   
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,0 );           //publish the message 
+		reply = 0;    //reset the case
+	}
+	
+	//whenever the device is disconnect from wifi or lost of power - publish this message to ask for current time
+	if (connection==1) {
+		sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "SmartPetF");
+		transmit = "TimeLost";
+		length = strlen(transmit);
+		mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,0 );
+		connection = 0;
+	}
+	for(int i=0;i<120;i++) messagecheck[i] = NULL;   //clear the old message for the new message
+	
+}
+
+/**
+ * \brief Callback to get the MQTT status update.
+ *
+ * \param[in] conn_id instance id of connection which is being used.
+ * \param[in] type type of MQTT notification. Possible types are:
+ *  - [MQTT_CALLBACK_SOCK_CONNECTED](@ref MQTT_CALLBACK_SOCK_CONNECTED)
+ *  - [MQTT_CALLBACK_CONNECTED](@ref MQTT_CALLBACK_CONNECTED)
+ *  - [MQTT_CALLBACK_PUBLISHED](@ref MQTT_CALLBACK_PUBLISHED)
+ *  - [MQTT_CALLBACK_SUBSCRIBED](@ref MQTT_CALLBACK_SUBSCRIBED)
+ *  - [MQTT_CALLBACK_UNSUBSCRIBED](@ref MQTT_CALLBACK_UNSUBSCRIBED)
+ *  - [MQTT_CALLBACK_DISCONNECTED](@ref MQTT_CALLBACK_DISCONNECTED)
+ *  - [MQTT_CALLBACK_RECV_PUBLISH](@ref MQTT_CALLBACK_RECV_PUBLISH)
+ * \param[in] data A structure contains notification informations. @ref mqtt_data
+ */
+static void mqtt_callback(struct mqtt_module *module_inst, int type, union mqtt_data *data)
+{
+	switch (type) {
+	case MQTT_CALLBACK_SOCK_CONNECTED:
+	{
+		/*
+		 * If connecting to broker server is complete successfully, Start sending CONNECT message of MQTT.
+		 * Or else retry to connect to broker server.
+		 */
+		if (data->sock_connected.result >= 0) {
+			printf("\r\nConnecting to Broker...");
+			//printf("\n%i", seconds);
+			mqtt_connect_broker(module_inst, 1, NULL, NULL, mqtt_user, NULL, NULL, 0, 0, 0);
+		} else {
+			printf("Connect fail to server(%s)! retry it automatically.\r\n", main_mqtt_broker);
+			mqtt_connect(module_inst, main_mqtt_broker); /* Retry that. */
+		}
+	}
+	break;
+
+	case MQTT_CALLBACK_CONNECTED:
+		if (data->connected.result == MQTT_CONN_RESULT_ACCEPT) {
+			/* Subscribe chat topic. */
+			mqtt_subscribe(module_inst, MAIN_CHAT_TOPIC "#", 0, SubscribeHandler);
+			/* Enable USART receiving callback. */
+			usart_enable_callback(&cdc_uart_module, USART_CALLBACK_BUFFER_RECEIVED);
+			printf("Preparation of the chat has been completed.\r\n");
+			connection = 1;
+			wifi_disconnect = 0;
+			t=1;
+			int z = real_time/10000;                         //calculate for the total second
+			seconds = 100*(z*3600+(real_time/100-z*100)*60+(real_time-(real_time/100)*100));
+			printf("\nReal time:%i", real_time);
+			wifi_dis_timeend = real_time;
+			wifi_dis_time = 0;
+			
+		} else {
+			/* Cannot connect for some reason. */
+			printf("MQTT broker decline your access! error code %d\r\n", data->connected.result);
+		}
+
+		break;
+
+	case MQTT_CALLBACK_DISCONNECTED:
+		/* Stop timer and USART callback. */
+		printf("MQTT disconnected\r\n");
+		t=480;
+		printf("\nReal time: %i", real_time);
+		usart_disable_callback(&cdc_uart_module, USART_CALLBACK_BUFFER_RECEIVED);
+		break;
+	}
+}
+
+/**
+ * \brief Configure UART console.
+ */
+static void configure_console(void)
+{
+	struct usart_config usart_conf;
+
+	usart_get_config_defaults(&usart_conf);
+	usart_conf.mux_setting = EDBG_CDC_SERCOM_MUX_SETTING;
+	usart_conf.pinmux_pad0 = EDBG_CDC_SERCOM_PINMUX_PAD0;
+	usart_conf.pinmux_pad1 = EDBG_CDC_SERCOM_PINMUX_PAD1;
+	usart_conf.pinmux_pad2 = EDBG_CDC_SERCOM_PINMUX_PAD2;
+	usart_conf.pinmux_pad3 = EDBG_CDC_SERCOM_PINMUX_PAD3;
+	usart_conf.baudrate    = 115200;
+
+	stdio_serial_init(&cdc_uart_module, EDBG_CDC_MODULE, &usart_conf);
+	/* Register USART callback for receiving user input. */
+	usart_register_callback(&cdc_uart_module, (usart_callback_t)uart_callback, USART_CALLBACK_BUFFER_RECEIVED);
+	usart_enable(&cdc_uart_module);
+}
+
+/**
+ * \brief Configure MQTT service.
+ */
+static void configure_mqtt(void)
+{
+	struct mqtt_config mqtt_conf;
+	int result;
+
+	mqtt_get_config_defaults(&mqtt_conf);
+	/* To use the MQTT service, it is necessary to always set the buffer and the timer. */
+	mqtt_conf.read_buffer = mqtt_read_buffer;
+	mqtt_conf.read_buffer_size = MAIN_MQTT_BUFFER_SIZE;
+	mqtt_conf.send_buffer = mqtt_send_buffer;
+	mqtt_conf.send_buffer_size = MAIN_MQTT_BUFFER_SIZE;
+	
+	result = mqtt_init(&mqtt_inst, &mqtt_conf);
+	if (result < 0) {
+		printf("MQTT initialization failed. Error code is (%d)\r\n", result);
+		while (1) {
+		}
+	}
+
+	result = mqtt_register_callback(&mqtt_inst, mqtt_callback);
+	if (result < 0) {
+		printf("MQTT register callback failed. Error code is (%d)\r\n", result);
+		while (1) {
+		}
+	}
+}
+
+/**
+ * \brief Checking the USART buffer.
+ *
+ * Finding the new line character(\n or \r\n) in the USART buffer.
+ * If buffer was overflowed, Sending the buffer.
+ */
+static void check_usart_buffer(char *topic)
+{
+	int i;
+
+	/* Publish the input string when newline was received or input string is bigger than buffer size limit. */
+	if (uart_buffer_written >= MAIN_CHAT_BUFFER_SIZE) {
+		mqtt_publish(&mqtt_inst, topic, uart_buffer, MAIN_CHAT_BUFFER_SIZE, 0, 0);
+		uart_buffer_written = 0;
+	} else {
+		for (i = 0; i < uart_buffer_written; i++) {
+			/* Find newline character ('\n' or '\r\n') and publish the previous string . */
+			if (uart_buffer[i] == 0x0d) {
+				mqtt_publish(&mqtt_inst, topic, uart_buffer, (i > 0 && uart_buffer[i - 1] == 0x0a) ? i - 1 : i, 0, 0);
+				/* Move remain data to start of the buffer. */
+				if (uart_buffer_written > i + 1) {
+					memmove(uart_buffer, uart_buffer + i + 1, uart_buffer_written - i - 1);
+					uart_buffer_written = uart_buffer_written - i - 1;
+				} else {
+					uart_buffer_written = 0;
+				}
+
+				break;
+			}
+		}
+	}
+}
+/**
+ * \brief Main application function.
+ *
+ * Application entry point.
+ *
+ * \return program return value.
+ */
+int main(void)
+{
+	Simple_Clk_Init();
+	enable_clock();
+	enable_tc();
+	enable_interrupt();
+	init_adc();
+	init_adc2();
+	
+	//Read ADC from the proximity sensor	
+	x = read_adc();
+	food_level = x*3300/4095;
+	
+	//Read ADC for the weight sensor
+	y = read_adc2();  
+	weight = y*3300/4095;
+	if ((weight>=weightlevel)&&(weight<weightlevel0)) bowl_portion = "0";
+	else if ((weight>=weightlevel0)&&(weight<weightlevel1)) bowl_portion = "1";
+	else if ((weight>=weightlevel1)&&(weight<weightlevel2)) bowl_portion = "2";
+	else if ((weight>=weightlevel2)&&(weight<weightlevel3)) bowl_portion = "3";
+	else if ((weight>=weightlevel3)&&(weight<weightlevel4)) bowl_portion = "4";
+	else if ((weight>=weightlevel4)&&(weight<weightlevel5)) bowl_portion = "5";
+	else if ((weight>=weightlevel5)&&(weight<weightlevel6)) bowl_portion = "6";
+	//weight = 1.2;
+	
+	//bowl_portion = "3";
+
+
+	PortGroup *porB = &(ports->Group[1]);   // pointer to reference portB's adress
+	porB->DIRSET.reg = PORT_PB12 | PORT_PB13;
+	
+
+	tstrWifiInitParam param;
+	int8_t ret;
+	char topic[strlen(MAIN_CHAT_TOPIC) + MAIN_CHAT_USER_NAME_SIZE + 1];
+	
+	char FBstring[50] = {0};
+	
+
+	/* Initialize the board. */
+	system_init();
+
+	/* Initialize the UART console. */
+	configure_console();
+
+	/* Output example information */
+	printf(STRING_HEADER);
+
+	/* Initialize the MQTT service. */
+	configure_mqtt();
+
+	/* Initialize the BSP. */
+	nm_bsp_init();
+
+	/* Setup user name first */
+	/* printf("Enter the user name (Max %d characters)\r\n", MAIN_CHAT_USER_NAME_SIZE);
+	scanf("%64s", mqtt_user);*/
+	printf("User : %s\r\n", mqtt_user);
+	sprintf(topic, "%s%s", MAIN_CHAT_TOPIC, mqtt_user);
+	printf("\r\nTopic : %s",topic);  
+	printf("\r\nWeight : %i", y);  
+	printf("\r\nLevel : %i\r\n",x); 
+	Sub_Topic = topic;
+	//TopicFoodBowl = topic;
+	/* Initialize Wi-Fi parameters structure. */
+	memset((uint8_t *)&param, 0, sizeof(tstrWifiInitParam));
+
+	/* Initialize Wi-Fi driver with data and status callbacks. */
+	param.pfAppWifiCb = wifi_callback; /* Set Wi-Fi event callback. */
+	ret = m2m_wifi_init(&param);
+	if (M2M_SUCCESS != ret) {
+		printf("main: m2m_wifi_init call error!(%d)\r\n", ret);
+		while (1) { /* Loop forever. */}
+	}
+
+	/* Initialize socket interface. */
+	socketInit();
+	registerSocketCallback(socket_event_handler, socket_resolve_handler);
+
+	/* Connect to router. */
+	m2m_wifi_connect((char *)MAIN_WLAN_SSID, sizeof(MAIN_WLAN_SSID),
+			MAIN_WLAN_AUTH, (char *)MAIN_WLAN_PSK, M2M_WIFI_CH_ALL);
+
+	if (SysTick_Config(system_cpu_clock_get_hz() / 1000)) 
+	{
+		puts("ERR>> Systick configuration error\r\n");
+		while (1);
+	}
+	int tot_second;
+	int Wifi_dis_sec;
+	int Wifi_con_sec;
+	int schedule[3];
+	//int check = 0;
+	while (1) {
+		//calculate the real time
+		if (t==1){
+		tot_second = seconds/(100);
+		Wifi_con_sec = tot_second;
+		}
+		else if (t==480){
+		Wifi_dis_sec = seconds/(100*t);
+		tot_second = Wifi_con_sec + Wifi_dis_sec;
+		}
+		hour = tot_second/3600;
+		minute = (tot_second-hour*3600)/60;
+		sec = (tot_second -(3600*hour)-(minute*60));
+		real_time = hour*10000+minute*100+sec;
+		
+		/*for (int i;i<3;i++) {
+			if (schedule_time[i]>empty_schedule) schedule_pending[i] = schedule_time[i];
+			else if (schedule_time[i]==empty_schedule) schedule_pending[i] = empty;
+		}
+		int pendingNum = NONE;
+		if ((schedule_pending[0]<=schedule_pending[1])&&(schedule_pending[0]<=schedule_pending[2])){
+			pendingNum = 0;
+		}
+		else if ((schedule_pending[1]<=schedule_pending[0])&&(schedule_pending[1]<=schedule_pending[2])){
+			pendingNum = 1;
+		}
+		else if ((schedule_pending[2]<=schedule_pending[0])&&(schedule_pending[2]<=schedule_pending[1])){
+			pendingNum = 2;
+		}
+		else if ((schedule_pending[0]==empty)&&(schedule_pending[1]==empty)&&(schedule_pending[2]==empty)){
+			pendingNum = NONE;
+		}
+		
+		if (check != schedule_pending[pendingNum]){
+			sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "PendingSc");
+			char Pendingstring[50] = {0};
+			if (pendingNum!=NONE)
+				sprintf(Pendingstring, "Pending Schedule: %i", schedule_time[pendingNum]);
+			else if (pendingNum==NONE) 
+				sprintf(Pendingstring, "Pending Schedule: none");
+			transmit = Pendingstring;
+			length = strlen(transmit);
+			mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );
+			check = schedule_pending[pendingNum];
+		}*/
+		
+		//get the next order for feeding schedule
+		for (int i=0;i<3;i++){
+			int order = i+1;
+			if (i == 2) order = 0;
+			if ((schedule_time[i] > empty_schedule) && (schedule_time[order] == empty_schedule)) feed_order = order;
+		}
+		
+		if(portion_checktime==real_time){
+			sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "ChecBDisp");
+			transmit = "Check before dispense";                              //call for a food level checking
+			length = strlen(transmit);
+			mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,0 );           //publish the message
+			portion_checktime = -1;
+		}
+		
+		//when ever the schedule is matched with real time, rotate
+		//Set up back up schedule in case of wifi disconnected
+		for (int i=0;i<3;i++){
+			if ((schedule_time[i]>0)&&(schedule_time[i] <= 90000)) backup_sche[0]=schedule_time[i];
+			else if ((schedule_time[i]>90000)&&(schedule_time[i] <= 160000)) backup_sche[1]=schedule_time[i];
+			else if ((schedule_time[i]>160000)&&(schedule_time[i] <= 235959)) backup_sche[2]=schedule_time[i];
+			
+			if (wifi_disconnect == 1)
+			   schedule[i] = backup_sche[i];        //use back up schedule if wifi disconnected
+			else if (wifi_disconnect == 0)
+			   schedule[i] = schedule_time[i];      //use regular wifi if wifi connected
+			
+			if ((schedule[i]>=0)&&(schedule[i] == real_time)){    //based on real time
+		                                                          //rotate the motor
+					porB->OUTSET.reg = PORT_PB12;
+					wait(duration*portionn[i]);
+					porB->OUTCLR.reg = PORT_PB12;
+					seconds=seconds+duration_time*t*portionn[i];
+					
+					if (half_feed == True) {                      //dsipense half of portion
+						porB->OUTSET.reg = PORT_PB12;
+						wait(duration/2);
+						porB->OUTCLR.reg = PORT_PB12;
+						seconds=seconds+duration_time/2*t;
+						half_feed = False;
+					}
+				
+				schedule_time[i] = empty_schedule; 
+				feed_order=i; 
+				reply = 8; 
+				sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, schedule_topic[i]);
+				sprintf(no_schedule, "Schedule %i: -1",i+1);                     //after every feed, reset the schedule to none
+				transmit = no_schedule;
+				length = strlen(transmit);
+				mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );
+				//seconds=seconds+500;                                   
+				int FBtotsec = (seconds+360000)/100;
+				FBhour = FBtotsec/3600;                                             
+				FBminute = (FBtotsec-FBhour*3600)/60;
+				FBsecond = (FBtotsec -(3600*FBhour)-(FBminute*60));
+				feedstatus_checktime = FBhour*10000+FBminute*100+FBsecond;        //calculate leftover food check time
+				
+				sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "Food-Bowl");
+				sprintf(FBstring, "Food-on-bowl status update time: %i", feedstatus_checktime);
+				transmit = FBstring;
+				length = strlen(transmit);
+				mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );
+				
+				sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "CTschedul");          //set up current time
+				char CTstring[50] = {0};
+				sprintf(CTstring, "ct %i", real_time+3);
+				transmit = CTstring;
+				length = strlen(transmit);
+				mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );
+				
+				sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "FoLVCheck");          //check the food level right after
+				transmit = "level";
+				length = strlen(transmit);
+				mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,0 );
+			}
+			else porB->OUTCLR.reg = PORT_PB12;
+			
+		}
+		
+		//Check leftover food 2 minute before the feeding schedule
+		for (int check=0;check<3;check++){
+			if (fsct[check] == real_time) {
+				fsct[check] = -1;
+				sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "Food-Bowl");
+				char CTstring[75] = {0};
+				if (real_time<100000)    //if real time is less than 10:00am
+					sprintf(CTstring, "ct 0%i. Checking before dispensing based on schedule %i", real_time+3, check); 		        
+				else 
+				    sprintf(CTstring, "ct %i. Checking before dispensing based on schedule %i", real_time+3, check); 
+				transmit = CTstring;
+				length = strlen(transmit);
+	
+				mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );
+				NVIC_SystemReset();
+			}
+		}
+		
+		//Checking the leftover food 1 hour after the dispense 
+		if (feedstatus_checktime == real_time) {
+			feedstatus_checktime=-1;
+			sprintf(Sub_Topic, "%s%s", MAIN_CHAT_TOPIC, "Food-Bowl");
+			char CTstring[75] = {0};
+			if (real_time<100000)    //if real time is less than 10:00am
+			   sprintf(CTstring, "ct 0%i. Checking the amount of food on bowl...", real_time+3);
+			else
+			   sprintf(CTstring, "ct %i. Checking the amount of food on bowl...", real_time+3);
+
+			transmit = CTstring;
+			length = strlen(transmit);
+			mqtt_publish(&mqtt_inst, Sub_Topic, transmit, length, 0,1 );
+			
+			NVIC_SystemReset();
+		}
+		/* Handle pending events from network controller. */
+		m2m_wifi_handle_events(NULL);
+		/* Try to read user input from USART. */
+		usart_read_job(&cdc_uart_module, &uart_ch_buffer);
+		/* Checks the USART buffer. */
+		check_usart_buffer(topic);
+		
+		if(mqtt_inst.isConnected)
+			mqtt_yield(&mqtt_inst, 0);
+		TC5_Handler() ;
+		
+		/*if (weightcheck == 1) {
+			reply = 9;
+			weightcheck = 0;
+		} */
+	}
+	
+
+}
+
+void enable_clock(void)
+{
+	
+	PM->APBCMASK.reg |=  0x1u<<13;    // TC5
+	PM->APBCMASK.reg |=  0x1u<<16;    // ADC
+	
+	uint32_t temp = 0x1C; 			            // ID for TC4, TC5
+	temp |= 0<<8; 					    // Selection Generic clock generator 0
+	GCLK->CLKCTRL.reg = temp; 			// Setup in the CLKCTRL register
+	GCLK->CLKCTRL.reg |= 0x1u << 14;    // enable it.
+	
+	temp = 0x1E; 			              // ID for ADC
+	temp |= 0<<8; 					// Selection Generic clock generator 0
+	GCLK->CLKCTRL.reg = temp; 			// Setup in the CLKCTRL register
+	GCLK->CLKCTRL.reg |= 0x1u << 14; 		// enable it.*/
+}
+
+void enable_tc(void){
+
+	
+	//TC5 for the timer interrupt trigger for key pad, state machine -  60Hz
+	tcPtr->CTRLA.reg = 0;            //counter mode
+	while(tcPtr->STATUS.reg & TC_STATUS_SYNCBUSY) {}
+	tcPtr->CTRLA.bit.MODE = 0x0;        //16-bit mode
+	tcPtr->CTRLA.bit.WAVEGEN = 0x3;     //MPWM
+	tcPtr->CTRLA.bit.PRESCALER = 0x7;   // div1024
+	//tcPtr->CTRLA.bit.PRESCSYNC = 0x1;   // sync with the chosen prescaler
+	tcPtr->CC[0].reg = 7812.5;               // with the prescaler, this set the timer to interrupt about 60Hz 
+	while(tcPtr->STATUS.reg & TC_STATUS_SYNCBUSY) {}
+	tcPtr->CTRLA.reg |= 0x2;            //enable TC5
+	while(tcPtr->STATUS.reg & TC_STATUS_SYNCBUSY) {}
+	
+}
+
+void init_adc(void)
+{
+	PortGroup *porA = &(ports->Group[0]);   // pointer to reference portA's address
+	while(adcPtr->STATUS.reg & ADC_STATUS_SYNCBUSY){}
+	adcPtr -> CTRLA.reg = 0;				//ADC block is disabled
+	while(adcPtr->STATUS.reg & ADC_STATUS_SYNCBUSY){}  //synchronize the generic clock and adc clock
+	// you will need to configure 5 registers, see Section 29.7
+	adcPtr -> REFCTRL.reg = 0x2;	//refctrl.reg - set Vref = 1/2 Vin
+	adcPtr -> AVGCTRL.reg = 0x0;	//avgctrl.reg - only collect 1 sample
+	//adcPtr -> SAMPCTRL.reg = 0x1f;	//sampctrl.reg
+	adcPtr -> CTRLB.bit.PRESCALER = 0x7;	//ctrlb.reg - maximum prescaler
+	adcPtr -> CTRLB.bit.RESSEL = 0x0;       // set the conversion into 12bit
+	adcPtr -> CTRLB.bit.FREERUN= 0x1;
+	adcPtr -> INPUTCTRL.bit.GAIN = 0xf;	//inputctrl.reg (muxpos, muxneg, gain)
+	adcPtr -> INPUTCTRL.bit.MUXPOS = 0x13;       // set to PA11 - AIN19
+	adcPtr -> INPUTCTRL.bit.MUXNEG = 0x18;       // negative to ground
+
+	porA -> PMUX[5].bit.PMUXO = 0x1;		// enable peripheral B for PA11
+	porA -> PINCFG[11].bit.PMUXEN = 0x1;	//refer to pg374 data sheet
+	
+	while(adcPtr->STATUS.reg & ADC_STATUS_SYNCBUSY){}
+	adcPtr -> CTRLA.reg = (0b1<<1) ;				//Enable ADC
+	while(adcPtr->STATUS.reg & ADC_STATUS_SYNCBUSY){}
+}
+
+void init_adc2(void)
+{
+	PortGroup *porA = &(ports->Group[0]);   // pointer to reference portA's address
+	while(adcPtr2->STATUS.reg & ADC_STATUS_SYNCBUSY){}  //synchronize the generic clock and adc clock	
+	adcPtr2 -> CTRLA.reg |= 0;				//ADC block is disabled
+	while(adcPtr2->STATUS.reg & ADC_STATUS_SYNCBUSY){}  //synchronize the generic clock and adc clock
+	// you will need to configure 5 registers, see Section 29.7
+	adcPtr2 -> REFCTRL.reg = 0x2;	//refctrl.reg - set Vref = 1/2 Vin
+	adcPtr2 -> AVGCTRL.reg = 0x0;	//avgctrl.reg - only collect 1 sample
+	//adcPtr -> SAMPCTRL.reg = 0x1f;	//sampctrl.reg
+	adcPtr2 -> CTRLB.bit.PRESCALER = 0x7;	//ctrlb.reg - maximum prescaler
+	adcPtr2 -> CTRLB.bit.RESSEL = 0x0;       // set the conversion into 12bit
+	adcPtr2 -> CTRLB.bit.FREERUN= 0x1;
+	adcPtr2 -> INPUTCTRL.bit.GAIN = 0xf;	//inputctrl.reg (muxpos, muxneg, gain)
+	adcPtr2 -> INPUTCTRL.bit.MUXPOS = 0x00;       // set to PA10 - AIN18
+	adcPtr2 -> INPUTCTRL.bit.MUXNEG = 0x18;       // negative to ground
+
+	porA -> PMUX[1].bit.PMUXE = 0x1;		// enable peripheral B for PA10
+	porA -> PINCFG[2].bit.PMUXEN = 0x1;	//refer to pg374 data sheet
+	
+	while(adcPtr2->STATUS.reg & ADC_STATUS_SYNCBUSY){}
+	adcPtr2 -> CTRLA.reg = (0b1<<1) ;				//Enable ADC
+	while(adcPtr2->STATUS.reg & ADC_STATUS_SYNCBUSY){}
+}
+
+void enable_interrupt(void){
+	NVIC->ISER[0] = (1<<20);          //enable interrupt for TC5
+	NVIC->IP[5] = 0x00000040;         // TC5: priority level 1
+	tcPtr->INTENSET.bit.MC0 = 0x1;    //set interrupt at every overflow/underflow
+}
+
+void TC5_Handler(void){   //handler interrupt
+
+	seconds = (seconds + 1);          //add 1 second every interruption
+	if (seconds/t>=(seconds_per_day)) seconds = 0;
+	tcPtr->INTFLAG.bit.MC0 |= 0x1;  	//reset the interrupt flag
+}
+
+///Simple Clock Initialization
+//Simple Clock Initialization
+void Simple_Clk_Init(void)
+{
+	/* Various bits in the INTFLAG register can be set to one at startup.
+	This will ensure that these bits are cleared */
+
+	SYSCTRL->INTFLAG.reg = SYSCTRL_INTFLAG_BOD33RDY | SYSCTRL_INTFLAG_BOD33DET |
+		SYSCTRL_INTFLAG_DFLLRDY;
+
+	//system_flash_set_waitstates(0);  //Clock_flash wait state =0
+
+	SYSCTRL_OSC8M_Type temp = SYSCTRL->OSC8M;      /* for OSC8M initialization  */
+
+	temp.bit.PRESC = 0;    // no divide, i.e., set clock=8Mhz  (see page 170)
+	temp.bit.ONDEMAND = 1;    //  On-demand is true
+	temp.bit.RUNSTDBY = 0;    //  Standby is false
+
+	SYSCTRL->OSC8M = temp;
+
+	SYSCTRL->OSC8M.reg |= 0x1u << 1;  //SYSCTRL_OSC8M_ENABLE bit = bit-1 (page 170)
+
+	PM->CPUSEL.reg = (uint32_t)0;		// CPU and BUS clocks Divide by 1  (see page 110)
+	PM->APBASEL.reg = (uint32_t)0;		// APBA clock 0= Divide by 1  (see page 110)
+	PM->APBBSEL.reg = (uint32_t)0;		// APBB clock 0= Divide by 1  (see page 110)
+	PM->APBCSEL.reg = (uint32_t)0;		// APBB clock 0= Divide by 1  (see page 110)
+
+	PM->APBAMASK.reg |= 01u << 3;   // Enable Generic clock controller clock (page 127)
+
+									/* Software reset Generic clock to ensure it is re-initialized correctly */
+
+	GCLK->CTRL.reg = 0x1u << 0;   // Reset gen. clock (see page 94)
+	while (GCLK->CTRL.reg & 0x1u) {  /* Wait for reset to complete */ }
+
+	// Initialization and enable generic clock #0
+	while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY) {}
+	*((uint8_t*)&GCLK->GENDIV.reg) = 0;  // Select GCLK0 (page 104, Table 14-10)
+	while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY) {}
+	GCLK->GENDIV.reg = 0x0100;   		 // Divide by 1 for GCLK #0 (page 104)
+	while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY) {}
+	GCLK->GENCTRL.reg = 0x030600;  		 // GCLK#0 enable, Source=6(OSC8M), IDC=1 (page 101)
+}
+
+
+
+
+
+
